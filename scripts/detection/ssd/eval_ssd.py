@@ -20,6 +20,9 @@ from gluoncv.utils.metrics.voc_detection import VOC07MApMetric
 from gluoncv.utils.metrics.coco_detection import COCODetectionMetric
 from mxnet.contrib.quantization import *
 
+import quantization_auto_tuning_tool as at
+from quantization_auto_tuning_tool.mxnet_quantize_utils import *
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Eval SSD networks.')
     parser.add_argument('--network', type=str, default='vgg16_atrous',
@@ -68,6 +71,14 @@ def parse_args():
                              ' thresholds. This mode is expected to produce the best inference accuracy of all three'
                              ' kinds of quantized models if the calibration dataset is representative enough of the'
                              ' inference dataset.')
+    parser.add_argument('--auto_tuning',
+                        action='store_true',
+                        help='Use with --only_inference, If set, will use auto-tuning tool to do INT8 inference.')
+    parser.add_argument('--auto_tuning_config',
+                        type=str,
+                        default='./config_ssd.ini',
+                        help='Config for auto-tuning tool. Must provide when use --auto_tuning. default is ./config_ssd.ini ')
+
     args = parser.parse_args()
     return args
 
@@ -140,6 +151,32 @@ def validate(net, val_data, ctx, classes, size, metric):
         print('Throughput is %f img/sec.'% speed)
     return metric.get()
 
+def test_func(graph, customized_args):
+    '''
+    'dev_data_list':val_dataset,
+            'metric':val_metric,
+            'calib_data':val_data,
+    '''
+    val_dataset = customized_args.customized_dict['dev_data_list']
+    val_data = customized_args.customized_dict['calib_data']
+    metric = customized_args.customized_dict['metric']
+    classes = val_dataset.classes
+    size = len(val_dataset)
+    ctx = [mx.cpu()]
+    tic = time.time()
+    results = validate(graph, val_data, ctx, classes, size, metric)
+    toc = time.time()
+
+    acc = -1
+    speed = size/(toc-tic)
+    for k, v in zip(results[0], results[1]):
+        if k == 'mAP':
+            acc = v
+        print("%s : %f" %(k, v))
+    print("speed is: %f img/s" % speed)
+
+    return acc, speed
+
 if __name__ == '__main__':
     args = parse_args()
     logging.basicConfig()
@@ -206,6 +243,28 @@ if __name__ == '__main__':
                               '-quantized-' + args.calib_mode)
         logger.info('Saving quantized model at %s' % dst_dir)
         net.export(prefix, epoch=0)
+        sys.exit()
+
+    # inference on dev data
+    if args.auto_tuning:
+        
+        collector = None
+        customized_args = {
+            'dev_data_list':val_dataset,
+            'metric':val_metric,
+            'calib_data':val_data,
+            'label_names':None,
+            'data_names':None,
+            'prefix': "ssd_mobilenet1.0_512",
+            # 'LayerOutputCollector':collector
+        }
+        bert_customized_args = Customized_args(**customized_args)
+
+        at_bert = at.AutoTuning(fp32_graph=net,
+                                tuning_config_path=args.auto_tuning_config,
+                                customized_args=bert_customized_args)
+
+        at_bert.tuning(calib_func=None, test_func=test_func)
         sys.exit()
 
     # eval
